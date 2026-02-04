@@ -1,0 +1,1 @@
+flwr run . 2>&1 | tee pass_output.log
