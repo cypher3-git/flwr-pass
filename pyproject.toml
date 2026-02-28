@@ -21,28 +21,30 @@ packages = ["."]
 publisher = "flwrlabs"
 
 [tool.flwr.app.components]
-serverapp = "passexample.server_app:app"
-clientapp = "passexample.client_app:app"
+serverapp = "passexample.server_app_gtg:app"
+clientapp = "passexample.client_app_gtg:app"
 
 [tool.flwr.app.config]
-num-server-rounds = 20
+num-server-rounds = 10
 fraction-evaluate = 0.5
-local-epochs = 1
-learning-rate = 0.1
-batch-size = 16
+local-epochs = 2
+learning-rate = 0.01
+batch-size = 64
 # PASS hyperparameters
-sigma-squared = 0.01
-gamma = 0.9
-alpha = 0.95
+alpha = 0.2
 beta = 1.75
-dataset = "mnist"
+dataset = "cifar10"
+# GTG-Shapley hyperparameters (Optimized)
+gtg-sampling-rounds = 10
+gtg-within-threshold = 0.005
+gtg-between-threshold = 0.01
 
 [tool.flwr.federations]
 default = "local-simulation"
 
 [tool.flwr.federations.local-simulation]
-options.num-supernodes = 3
-options.backend.client-resources.num-cpus = 1
+options.num-supernodes = 10
+options.backend.client-resources.num-cpus = 2
 options.backend.client-resources.num-gpus = 0.2
 
 [tool.flwr.federations.supergrid-deployment]

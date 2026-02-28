@@ -143,24 +143,101 @@ def load_centralized_dataset(dataset: str, batch_size: int):
 
 # ==================== 训练和测试函数 ====================
 
-def train(net, trainloader, epochs, lr, device, img_key):
+def train(model, trainloader, epochs, lr, device, img_key):
     """Train the model on the training set."""
-    net.to(device)
-    criterion = torch.nn.CrossEntropyLoss().to(device)
-    optimizer = torch.optim.SGD(net.parameters(), lr=lr)
-    net.train()
-    running_loss = 0.0
-    for _ in range(epochs):
+    model.to(device)
+    model.train()
+    criterion = torch.nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+    
+    for epoch in range(epochs):
         for batch in trainloader:
-            images = batch[img_key].to(device)
-            labels = batch["label"].to(device)
+            if isinstance(batch, dict):
+                images = batch[img_key].to(device)
+                labels = batch["label"].to(device)
+            else:
+                images, labels = batch[0].to(device), batch[1].to(device)
+            
             optimizer.zero_grad()
-            loss = criterion(net(images), labels)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            
+            if torch.isnan(loss):
+                print("Warning: NaN loss detected, skipping batch")
+                continue
+            
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            running_loss += loss.item()
-    avg_trainloss = running_loss / len(trainloader) if len(trainloader) > 0 else 0.0
-    return avg_trainloss
+    
+    return loss.item()
+
+
+def train_and_get_gradients(model, trainloader, epochs, lr, device, img_key):
+    """训练模型并返回累积的真实梯度
+    
+    Returns:
+        tuple: (loss, accumulated_gradients)
+    """
+    model.to(device)
+    model.train()
+    criterion = torch.nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+    
+    # 初始化累积梯度字典
+    accumulated_grads = {}
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            accumulated_grads[name] = torch.zeros_like(param.data).cpu()
+    
+    total_batches = 0
+    final_loss = 0.0
+    
+    for epoch in range(epochs):
+        for batch in trainloader:
+            if isinstance(batch, dict):
+                images = batch[img_key].to(device)
+                labels = batch["label"].to(device)
+            else:
+                images, labels = batch[0].to(device), batch[1].to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            
+            if torch.isnan(loss):
+                print("Warning: NaN loss detected, skipping batch")
+                continue
+            
+            loss.backward()
+            
+            # 累积梯度（在裁剪之前）
+            for name, param in model.named_parameters():
+                if param.requires_grad and param.grad is not None:
+                    accumulated_grads[name] += param.grad.data.cpu()
+            
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            total_batches += 1
+            final_loss = loss.item()
+    
+    # 平均梯度以避免数值爆炸
+    # 注意：累积梯度需要除以批次数，否则梯度会过大
+    if total_batches > 0:
+        for name in accumulated_grads:
+            accumulated_grads[name] /= total_batches
+    
+    # 转换为 state_dict 格式（使用模型参数的键名）
+    gradient_dict = {}
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            # 将 named_parameters 的名称映射到 state_dict 的键
+            state_dict_key = name
+            if state_dict_key in accumulated_grads:
+                gradient_dict[state_dict_key] = accumulated_grads[state_dict_key]
+    
+    return final_loss, gradient_dict
 
 
 def test(net, testloader, device, img_key):
