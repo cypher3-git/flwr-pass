@@ -19,7 +19,14 @@ import functools
 
 
 class GTGShapley:
-    """GTG-Shapley 贡献评估器"""
+    """GTG-Shapley 贡献评估器
+    
+    严格按照论文 Algorithm 1 实现：
+    - 轮间截断 (Between-round Truncation)
+    - 轮内截断 (Within-round Truncation)  
+    - 引导采样 (Guided Sampling)
+    - 基于梯度的子模型重构
+    """
     
     def __init__(
         self,
@@ -29,7 +36,9 @@ class GTGShapley:
         learning_rate: float = 0.01,
         num_sampling_rounds: int = 10,
         within_round_threshold: float = 0.01,
-        between_round_threshold: float = 0.05,
+        between_round_threshold: float = 0.005,
+        convergence_threshold: float = 0.05,
+        guided_sampling_m: int = 1,
     ):
         """
         Args:
@@ -37,9 +46,11 @@ class GTGShapley:
             test_loader: 测试数据加载器
             device: 计算设备
             learning_rate: 学习率（用于梯度重构）
-            num_sampling_rounds: Monte Carlo 采样轮数
-            within_round_threshold: Within-round 截断阈值
-            between_round_threshold: Between-round 截断阈值
+            num_sampling_rounds: Monte Carlo 最大采样轮数
+            within_round_threshold: ε_i - 轮内截断阈值
+            between_round_threshold: ε_b - 轮间截断阈值
+            convergence_threshold: 蒙特卡洛收敛判定阈值 (std/mean < threshold)
+            guided_sampling_m: 引导采样中前 m 个位置的循环占据数
         """
         self.model = model
         self.test_loader = test_loader
@@ -48,6 +59,8 @@ class GTGShapley:
         self.num_sampling_rounds = num_sampling_rounds
         self.within_threshold = within_round_threshold
         self.between_threshold = between_round_threshold
+        self.convergence_threshold = convergence_threshold
+        self.guided_sampling_m = guided_sampling_m
         
         # 性能优化：缓存评估结果
         self._eval_cache: Dict[str, float] = {}
@@ -438,96 +451,350 @@ class GTGShapley:
         
         return shapley_values
     
+    def evaluate_all_clients_with_deltas(
+        self,
+        base_model: dict,
+        client_deltas: Dict[str, dict],
+        data_sizes: Dict[str, int],
+        auditor_id: str,
+    ) -> Dict[str, float]:
+        """评估所有其他客户端的 Shapley 值（基于梯度更新）
+        
+        严格按照论文公式实现：
+        V(S) = V(M̃_S) = V(M^{(t)} + Σ_{i∈S} (|D_i|/|D_S|) * Δ_i)
+        
+        Args:
+            base_model: 基础模型参数 M^{(t)}
+            client_deltas: 客户端梯度更新字典 {客户端ID: Δ_i}
+            data_sizes: 客户端数据集大小字典 {客户端ID: |D_i|}
+            auditor_id: 审计者ID（自己）
+            
+        Returns:
+            其他客户端的 Shapley 值字典
+        """
+        # 清空缓存
+        self._eval_cache.clear()
+        
+        # 使用论文公式计算 Shapley 值
+        shapley_values = self._compute_shapley_with_deltas(
+            base_model, client_deltas, data_sizes, auditor_id
+        )
+        
+        return shapley_values
+    
+    def _compute_shapley_with_deltas(
+        self,
+        base_model: dict,
+        client_deltas: Dict[str, dict],
+        data_sizes: Dict[str, int],
+        auditor_id: str,
+    ) -> Dict[str, float]:
+        """GTG-Shapley Algorithm 1 实现（基于梯度更新）
+        
+        严格按照论文实现：
+        1. 轮间截断 (Between-round Truncation)
+        2. 引导采样 (Guided Sampling)
+        3. 轮内截断 (Within-round Truncation)
+        4. 基于梯度的子模型重构: M̃_S = M^{(t)} + Σ_{i∈S} (|D_i|/|D_S|) * Δ_i
+        5. 增量式 Shapley 值更新
+        6. 蒙特卡洛收敛判定
+        """
+        client_ids = [cid for cid in client_deltas.keys() if cid != auditor_id]
+        n = len(client_ids)
+        if n == 0:
+            return {}
+        
+        # ============================================================
+        # Step 1: 轮间截断 (Between-round Truncation)
+        # ============================================================
+        # 计算 v_0 = V(M^{(t)}) - 基础模型效用
+        v_0 = self._evaluate_with_cache(base_model, "base_model")
+        
+        # 计算 v_N = V(M^{(t+1)}) - 完全聚合后的效用
+        # 使用论文公式重构完整模型
+        all_deltas = [client_deltas[cid] for cid in client_ids]
+        all_data_sizes = [data_sizes.get(cid, 1) for cid in client_ids]
+        full_model = self.reconstruct_model_from_deltas(base_model, all_deltas, all_data_sizes)
+        v_N = self._evaluate_with_cache(full_model, "full_model")
+        
+        # 轮间截断判断：如果 |v_N - v_0| <= ε_b，跳过本轮
+        if abs(v_N - v_0) <= self.between_threshold:
+            print(f"[GTG-Shapley] Between-round truncation: |{v_N:.4f} - {v_0:.4f}| = {abs(v_N - v_0):.4f} <= {self.between_threshold}")
+            return {cid: 0.0 for cid in client_ids}
+        
+        # ============================================================
+        # Step 2: 初始化 Shapley 值
+        # ============================================================
+        shapley_values = {cid: 0.0 for cid in client_ids}
+        
+        # ============================================================
+        # Step 3: 蒙特卡洛采样循环
+        # ============================================================
+        k = 0  # 采样轮数计数器
+        m = min(self.guided_sampling_m, n)  # 引导采样的前 m 个位置
+        
+        while k < self.num_sampling_rounds:
+            k += 1
+            
+            # ============================================================
+            # Step 3.1: 引导采样生成排列 (Guided Sampling)
+            # ============================================================
+            permutation = self._generate_guided_permutation(client_ids, k, m)
+            
+            # ============================================================
+            # Step 3.2: 遍历排列，计算边际贡献（含轮内截断）
+            # ============================================================
+            prev_acc = v_0  # v_{j-1}^k 初始为 v_0
+            
+            for j, client_id in enumerate(permutation):
+                # ============================================================
+                # Step 3.2.1: 轮内截断判断 (Within-round Truncation)
+                # ============================================================
+                # 如果剩余潜在增益 |v_N - v_{j-1}^k| < ε_i，触发截断
+                if abs(v_N - prev_acc) < self.within_threshold:
+                    # 截断：后续所有客户端的边际贡献为 0
+                    marginal = 0.0
+                else:
+                    # ============================================================
+                    # Step 3.2.2: 使用论文公式重构子模型并计算效用
+                    # M̃_S = M^{(t)} + Σ_{i∈S} (|D_i|/|D_S|) * Δ_i
+                    # ============================================================
+                    clients_subset = permutation[:j + 1]
+                    cache_key = "|".join(sorted(clients_subset))
+                    
+                    # 收集子集的梯度更新和数据集大小
+                    subset_deltas = [client_deltas[cid] for cid in clients_subset]
+                    subset_data_sizes = [data_sizes.get(cid, 1) for cid in clients_subset]
+                    
+                    # 使用论文公式重构子模型
+                    subset_model = self.reconstruct_model_from_deltas(
+                        base_model, subset_deltas, subset_data_sizes
+                    )
+                    curr_acc = self._evaluate_with_cache(subset_model, cache_key)
+                    
+                    # 边际贡献 = v_j^k - v_{j-1}^k
+                    marginal = curr_acc - prev_acc
+                    prev_acc = curr_acc
+                
+                # ============================================================
+                # Step 3.2.3: 增量式 Shapley 值更新
+                # φ_i^{(t+1)} = (k-1)/k * φ_i^{(t+1)} + 1/k * marginal
+                # ============================================================
+                shapley_values[client_id] = ((k - 1) / k) * shapley_values[client_id] + (1 / k) * marginal
+            
+            # ============================================================
+            # Step 3.3: 蒙特卡洛收敛判定
+            # ============================================================
+            if k >= 3:  # 至少 3 轮后才检查收敛
+                if self._check_convergence(shapley_values):
+                    print(f"[GTG-Shapley] Converged after {k} sampling rounds")
+                    break
+        
+        return shapley_values
+    
     def _compute_all_shapley_values_optimized(
         self,
         initial_params: dict,
         all_client_params: Dict[str, dict],
         auditor_id: str,
     ) -> Dict[str, float]:
-        """优化的 Shapley 值计算：使用共享排列减少计算量
+        """GTG-Shapley Algorithm 1 实现
         
-        核心优化：每个排列可以同时计算所有客户端的边际贡献
+        严格按照论文实现：
+        1. 轮间截断 (Between-round Truncation)
+        2. 引导采样 (Guided Sampling)
+        3. 轮内截断 (Within-round Truncation)
+        4. 增量式 Shapley 值更新
+        5. 蒙特卡洛收敛判定
         """
         client_ids = [cid for cid in all_client_params.keys() if cid != auditor_id]
-        if not client_ids:
+        n = len(client_ids)
+        if n == 0:
             return {}
         
-        # 初始化边际贡献累加器
-        marginal_sums = {cid: [] for cid in client_ids}
+        # ============================================================
+        # Step 1: 轮间截断 (Between-round Truncation)
+        # ============================================================
+        # 计算 v_0 = V(M^{(t)}) - 初始模型效用
+        v_0 = self._evaluate_with_cache(initial_params, "initial")
         
-        # 生成共享排列并计算所有客户端的边际贡献
-        for round_idx in range(self.num_sampling_rounds):
-            # 随机排列客户端
-            permutation = client_ids.copy()
-            random.shuffle(permutation)
+        # 计算 v_N = V(M^{(t+1)}) - 完全聚合后的效用
+        all_params_list = [all_client_params[cid] for cid in client_ids]
+        full_aggregated = self.fedavg_aggregate_params(all_params_list)
+        v_N = self._evaluate_with_cache(full_aggregated, "full_aggregated")
+        
+        # 轮间截断判断：如果 |v_N - v_0| <= ε_b，跳过本轮
+        if abs(v_N - v_0) <= self.between_threshold:
+            print(f"[GTG-Shapley] Between-round truncation triggered: |{v_N:.4f} - {v_0:.4f}| = {abs(v_N - v_0):.4f} <= {self.between_threshold}")
+            return {cid: 0.0 for cid in client_ids}
+        
+        # ============================================================
+        # Step 2: 初始化 Shapley 值
+        # ============================================================
+        shapley_values = {cid: 0.0 for cid in client_ids}
+        
+        # ============================================================
+        # Step 3: 蒙特卡洛采样循环
+        # ============================================================
+        k = 0  # 采样轮数计数器
+        m = min(self.guided_sampling_m, n)  # 引导采样的前 m 个位置
+        
+        while k < self.num_sampling_rounds:
+            k += 1
             
-            # 计算该排列下所有客户端的边际贡献
-            marginals = self._compute_all_marginals_for_permutation(
-                initial_params, all_client_params, permutation
-            )
+            # ============================================================
+            # Step 3.1: 引导采样生成排列 (Guided Sampling)
+            # ============================================================
+            permutation = self._generate_guided_permutation(client_ids, k, m)
             
-            # 累加边际贡献
-            for cid, marginal in marginals.items():
-                marginal_sums[cid].append(marginal)
+            # ============================================================
+            # Step 3.2: 遍历排列，计算边际贡献（含轮内截断）
+            # ============================================================
+            prev_acc = v_0  # v_{j-1}^k 初始为 v_0
             
-            # 早停检查：如果所有客户端的方差都足够小，提前停止
-            if round_idx >= 2:
-                all_converged = True
-                for cid in client_ids:
-                    if len(marginal_sums[cid]) >= 3:
-                        std = np.std(marginal_sums[cid])
-                        if std >= self.within_threshold:
-                            all_converged = False
-                            break
-                if all_converged:
+            for j, client_id in enumerate(permutation):
+                # ============================================================
+                # Step 3.2.1: 轮内截断判断 (Within-round Truncation)
+                # ============================================================
+                # 如果剩余潜在增益 |v_N - v_{j-1}^k| < ε_i，触发截断
+                if abs(v_N - prev_acc) < self.within_threshold:
+                    # 截断：后续所有客户端的边际贡献为 0
+                    # v_j^k = v_{j-1}^k，所以 marginal = 0
+                    marginal = 0.0
+                else:
+                    # ============================================================
+                    # Step 3.2.2: 重构子模型并计算效用
+                    # ============================================================
+                    clients_subset = permutation[:j + 1]
+                    cache_key = "|".join(sorted(clients_subset))
+                    
+                    params_list = [all_client_params[cid] for cid in clients_subset]
+                    aggregated = self.fedavg_aggregate_params(params_list)
+                    curr_acc = self._evaluate_with_cache(aggregated, cache_key)
+                    
+                    # 边际贡献 = v_j^k - v_{j-1}^k
+                    marginal = curr_acc - prev_acc
+                    prev_acc = curr_acc
+                
+                # ============================================================
+                # Step 3.2.3: 增量式 Shapley 值更新
+                # φ_i^{(t+1)} = (k-1)/k * φ_i^{(t+1)} + 1/k * marginal
+                # ============================================================
+                shapley_values[client_id] = ((k - 1) / k) * shapley_values[client_id] + (1 / k) * marginal
+            
+            # ============================================================
+            # Step 3.3: 蒙特卡洛收敛判定
+            # ============================================================
+            if k >= 3:  # 至少 3 轮后才检查收敛
+                if self._check_convergence(shapley_values):
+                    print(f"[GTG-Shapley] Converged after {k} sampling rounds")
                     break
-        
-        # 计算平均 Shapley 值
-        shapley_values = {}
-        for cid in client_ids:
-            if marginal_sums[cid]:
-                shapley_values[cid] = np.mean(marginal_sums[cid])
-            else:
-                shapley_values[cid] = 0.0
         
         return shapley_values
     
-    def _compute_all_marginals_for_permutation(
+    def _generate_guided_permutation(
         self,
-        initial_params: dict,
-        all_client_params: Dict[str, dict],
-        permutation: List[str],
-    ) -> Dict[str, float]:
-        """计算一个排列下所有客户端的边际贡献
+        client_ids: List[str],
+        k: int,
+        m: int,
+    ) -> List[str]:
+        """引导采样生成排列 (Guided Sampling)
         
-        优化：增量计算，复用中间结果
+        论文 Section 3.2:
+        - 排列的前 m 位由 n 个参与者固定循环轮替占据
+        - 剩下的 n-m 位进行随机排列
+        
+        Args:
+            client_ids: 客户端ID列表
+            k: 当前采样轮数 (1-indexed)
+            m: 前 m 个位置的循环占据数
+            
+        Returns:
+            生成的排列
         """
-        marginals = {}
-        prev_acc = None
+        n = len(client_ids)
+        if m <= 0 or m > n:
+            # 退化为纯随机排列
+            permutation = client_ids.copy()
+            random.shuffle(permutation)
+            return permutation
         
-        for idx, client_id in enumerate(permutation):
-            # 计算 S = permutation[:idx] 的准确率
-            if prev_acc is None:
-                if idx == 0:
-                    # 空集，使用初始模型
-                    prev_acc = self._evaluate_with_cache(initial_params, "initial")
-                else:
-                    # 这不应该发生
-                    prev_acc = self._evaluate_with_cache(initial_params, "initial")
-            
-            # 计算 S ∪ {client_id} 的准确率
-            clients_with_target = permutation[:idx + 1]
-            cache_key = "|".join(sorted(clients_with_target))
-            
-            params_list = [all_client_params[cid] for cid in clients_with_target]
-            aggregated = self.fedavg_aggregate_params(params_list)
-            curr_acc = self._evaluate_with_cache(aggregated, cache_key)
-            
-            # 边际贡献
-            marginals[client_id] = curr_acc - prev_acc
-            prev_acc = curr_acc
+        # 确定前 m 个位置的客户端（循环轮替）
+        # 第 k 轮，前 m 个位置由 client_ids[(k-1)*m : (k-1)*m + m] 循环占据
+        front_indices = [(k - 1 + i) % n for i in range(m)]
+        front_clients = [client_ids[idx] for idx in front_indices]
         
-        return marginals
+        # 剩余客户端随机排列
+        remaining_clients = [cid for cid in client_ids if cid not in front_clients]
+        random.shuffle(remaining_clients)
+        
+        # 组合排列
+        permutation = front_clients + remaining_clients
+        return permutation
+    
+    def _check_convergence(self, shapley_values: Dict[str, float]) -> bool:
+        """蒙特卡洛收敛判定
+        
+        论文 Section 3.3:
+        收敛条件：估算的方差与均值的比例低于阈值
+        
+        这里使用简化的判定：所有 Shapley 值的变异系数 < threshold
+        """
+        values = list(shapley_values.values())
+        if not values:
+            return True
+        
+        mean_val = np.mean(np.abs(values))
+        if mean_val < 1e-10:
+            return True
+        
+        std_val = np.std(values)
+        cv = std_val / mean_val  # 变异系数
+        
+        return cv < self.convergence_threshold
+    
+    def reconstruct_model_from_deltas(
+        self,
+        base_params: dict,
+        deltas: List[dict],
+        data_sizes: List[int],
+    ) -> dict:
+        """论文公式：基于基础模型和梯度更新重构子模型
+        
+        公式: M̃_S = M^{(t)} + Σ_{i∈S} (|D_i|/|D_S|) * Δ_i
+        
+        Args:
+            base_params: 基础模型参数 M^{(t)}
+            deltas: 客户端梯度更新列表 [Δ_i]
+            data_sizes: 客户端数据集大小列表 [|D_i|]
+            
+        Returns:
+            重构的子模型参数
+        """
+        if not deltas:
+            return base_params
+        
+        # 计算子集总数据量 |D_S|
+        total_data_size = sum(data_sizes)
+        if total_data_size == 0:
+            total_data_size = len(deltas)  # 避免除零
+        
+        # 计算加权梯度聚合
+        aggregated_delta = {}
+        for key in base_params:
+            aggregated_delta[key] = torch.zeros_like(base_params[key], dtype=torch.float64)
+            for delta, data_size in zip(deltas, data_sizes):
+                if key in delta:
+                    weight = data_size / total_data_size
+                    aggregated_delta[key] += weight * delta[key].to(torch.float64)
+            aggregated_delta[key] = aggregated_delta[key].to(base_params[key].dtype)
+        
+        # 重构模型: M̃_S = M^{(t)} + aggregated_delta
+        reconstructed = {}
+        for key in base_params:
+            reconstructed[key] = base_params[key] + aggregated_delta[key]
+        
+        return reconstructed
     
     def _evaluate_with_cache(self, params: dict, cache_key: str) -> float:
         """带缓存的模型评估"""

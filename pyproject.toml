@@ -25,19 +25,21 @@ serverapp = "passexample.server_app_gtg:app"
 clientapp = "passexample.client_app_gtg:app"
 
 [tool.flwr.app.config]
-num-server-rounds = 10
+num-server-rounds = 20
 fraction-evaluate = 0.5
-local-epochs = 2
+local-epochs = 4
 learning-rate = 0.01
 batch-size = 64
 # PASS hyperparameters
-alpha = 0.2
-beta = 1.75
+alpha = 0.6     # 移动平均系数，增加历史权重以减少波动
+beta = 2.0      # 阈值系数，threshold = 1/(beta*N) = 0.05
 dataset = "cifar10"
-# GTG-Shapley hyperparameters (Optimized)
-gtg-sampling-rounds = 10
+# GTG-Shapley hyperparameters
+gtg-sampling-rounds = 30
 gtg-within-threshold = 0.005
-gtg-between-threshold = 0.01
+gtg-between-threshold = 0.005
+gtg-convergence-threshold = 0.05
+gtg-guided-sampling-m = 3
 
 [tool.flwr.federations]
 default = "local-simulation"
@@ -45,7 +47,7 @@ default = "local-simulation"
 [tool.flwr.federations.local-simulation]
 options.num-supernodes = 10
 options.backend.client-resources.num-cpus = 2
-options.backend.client-resources.num-gpus = 0.2
+options.backend.client-resources.num-gpus = 0.5
 
 [tool.flwr.federations.supergrid-deployment]
 address = "supergrid.flower.ai"

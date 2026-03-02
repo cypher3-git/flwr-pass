@@ -22,15 +22,24 @@ app = ServerApp()
 
 
 class PASSGTGState:
-    """PASS + GTG-Shapley 算法状态管理"""
-    def __init__(self, alpha: float = 0.8, beta: float = 1.75):
+    """PASS + GTG-Shapley 算法状态管理
+    
+    按照论文设计：
+    - 保存每轮的基础模型 M^{(t)}
+    - 保存客户端梯度更新 Δ_i = θ_i^{new} - M^{(t)}
+    - 保存客户端数据集大小 |D_i|
+    """
+    def __init__(self, alpha: float = 0.5, beta: float = 2.0):
         self.alpha = alpha  # 贡献分数移动平均系数
         self.beta = beta    # 阈值系数
         # 初始化贡献分数为 1.0
         self.contribution_scores: Dict[str, float] = defaultdict(lambda: 1.0)
-        self.previous_client_params: Dict[str, dict] = {}  # 上一轮客户端参数（用于 GTG-Shapley）
-        self.initial_global_params: dict = {}  # 初始模型（第0轮）
         self.cumulative_shapley: Dict[str, float] = defaultdict(float)  # 累积 Shapley 值
+        
+        # GTG-Shapley 核心状态（按照论文设计）
+        self.previous_base_model: dict = {}  # 上一轮的基础模型 M^{(t)}
+        self.previous_client_deltas: Dict[str, dict] = {}  # 上一轮客户端梯度更新 Δ_i
+        self.previous_client_data_sizes: Dict[str, int] = {}  # 上一轮客户端数据集大小 |D_i|
 
 
 pass_gtg_state = PASSGTGState()
@@ -45,8 +54,8 @@ def main(grid: Grid, context: Context):
     dataset = context.run_config["dataset"]
     lr = context.run_config["learning-rate"]
     batch_size = context.run_config["batch-size"]
-    alpha = context.run_config.get("alpha", 0.8)
-    beta = context.run_config.get("beta", 1.75)
+    alpha = context.run_config.get("alpha", 0.5)
+    beta = context.run_config.get("beta", 2.0)
     
     # 初始化 PASS 状态
     pass_gtg_state.alpha = alpha
@@ -79,7 +88,7 @@ def main(grid: Grid, context: Context):
     print(f"Dataset: {dataset}")
     print(f"Number of rounds: {num_rounds}")
     print(f"Learning rate: {lr}")
-    print(f"GTG-Shapley Parameters: α={alpha}, β={beta}")
+    print(f"GTG-Shapley Parameters: alpha={alpha}, beta={beta}")
     print("=" * 60)
     
     # 初始评估
@@ -150,19 +159,44 @@ def main(grid: Grid, context: Context):
         )
         
         # ============================================================
+        # 阶段 2.5: 计算客户端梯度更新 Δ_i = θ_i^{new} - M^{(t)}
+        # ============================================================
+        client_deltas: Dict[str, dict] = {}
+        client_data_sizes: Dict[str, int] = {}
+        
+        for info in client_info:
+            partition_id = info["partition_id"]
+            client_new_params = info["params"]
+            num_examples = info["num_examples"]
+            
+            # 计算梯度更新: Δ_i = θ_i^{new} - M^{(t)}
+            delta = {}
+            for key in global_params:
+                if key in client_new_params:
+                    delta[key] = client_new_params[key] - global_params[key]
+                else:
+                    delta[key] = torch.zeros_like(global_params[key])
+            
+            client_deltas[partition_id] = delta
+            client_data_sizes[partition_id] = num_examples
+        
+        # ============================================================
         # 阶段 3: 审计阶段 - 客户端使用 GTG-Shapley 互评
         # ============================================================
-        if pass_gtg_state.previous_client_params:
-            # 序列化上一轮的客户端参数（用于 GTG-Shapley）
-            client_params_encoded = serialize_updates_dict(pass_gtg_state.previous_client_params)
-            # 使用初始模型作为基准
-            initial_params_encoded = serialize_state_dict(pass_gtg_state.initial_global_params)
+        if pass_gtg_state.previous_client_deltas:
+            # 序列化上一轮的客户端梯度更新（用于 GTG-Shapley）
+            client_deltas_encoded = serialize_updates_dict(pass_gtg_state.previous_client_deltas)
+            # 使用上一轮的基础模型 M^{(t)} 作为基准
+            base_model_encoded = serialize_state_dict(pass_gtg_state.previous_base_model)
+            # 序列化数据集大小
+            data_sizes_encoded = serialize_state_dict({k: torch.tensor(v) for k, v in pass_gtg_state.previous_client_data_sizes.items()})
             
             audit_config = ConfigRecord({
                 "lr": lr,
                 "phase": "audit",
-                "other_client_params": client_params_encoded,  # 客户端参数
-                "initial_global_params": initial_params_encoded,
+                "client_deltas": client_deltas_encoded,  # 客户端梯度更新 Δ_i
+                "base_model": base_model_encoded,  # 基础模型 M^{(t)}
+                "data_sizes": data_sizes_encoded,  # 数据集大小 |D_i|
             })
             
             # 发送审计消息（发送新全局模型）
@@ -207,8 +241,13 @@ def main(grid: Grid, context: Context):
             if shapley_matrix:
                 update_contribution_scores_from_shapley(shapley_matrix, all_clients)
         
-        # 保存本轮的客户端参数，用于下一轮审计
-        pass_gtg_state.previous_client_params = client_params
+        # 保存本轮的状态，用于下一轮审计（按照论文设计）
+        # M^{(t)} = 本轮训练前的全局模型
+        pass_gtg_state.previous_base_model = {k: v.clone().cpu() for k, v in global_params.items()}
+        # Δ_i = 本轮客户端梯度更新
+        pass_gtg_state.previous_client_deltas = {k: {kk: vv.clone().cpu() for kk, vv in v.items()} for k, v in client_deltas.items()}
+        # |D_i| = 本轮客户端数据集大小
+        pass_gtg_state.previous_client_data_sizes = client_data_sizes.copy()
         
         # ============================================================
         # 阶段 4: 打印贡献分数并剔除搭便车者
@@ -225,12 +264,12 @@ def main(grid: Grid, context: Context):
             status = ""
             if score < threshold:
                 eliminated_clients.append(partition_id)
-                status = " ⚠️ ELIMINATED"
+                status = " [ELIMINATED]"
             
             print(f"  Client {partition_id}: score = {score:.4f}{status}")
         
         if eliminated_clients:
-            print(f"\n🚨 FREE-RIDERS DETECTED: {eliminated_clients}")
+            print(f"\n[FREE-RIDERS DETECTED]: {eliminated_clients}")
         
         # 更新全局模型
         global_params = new_global_params
@@ -287,10 +326,10 @@ def update_contribution_scores_from_shapley(
 ):
     """基于 Shapley 值更新贡献分数
     
-    使用累积 Shapley 值和相对排名：
+    使用归一化的累积 Shapley 值：
     1. 累积每轮的 Shapley 值
-    2. 基于累积值进行排名
-    3. 使用百分位数作为贡献分数
+    2. 归一化到 [0, 1] 范围
+    3. 使用移动平均更新贡献分数
     
     Args:
         shapley_matrix: Shapley 值矩阵 {被评估客户端: {评估者: Shapley值}}
@@ -310,25 +349,23 @@ def update_contribution_scores_from_shapley(
     for cid in all_clients:
         pass_gtg_state.cumulative_shapley[cid] += current_shapley[cid]
     
-    # 基于累积 Shapley 值排序
-    sorted_clients = sorted(
-        all_clients, 
-        key=lambda x: pass_gtg_state.cumulative_shapley[x]
-    )
+    # 归一化累积 Shapley 值到 [0, 1] 范围
+    cumulative_values = [pass_gtg_state.cumulative_shapley[cid] for cid in all_clients]
+    min_val = min(cumulative_values)
+    max_val = max(cumulative_values)
     
-    # 使用相对排名作为贡献分数
-    # 排名最低的客户端分数接近 0，排名最高的接近 1
-    n = len(sorted_clients)
-    for rank, cid in enumerate(sorted_clients):
-        # 百分位数分数：rank / (n - 1)，范围 [0, 1]
-        if n > 1:
-            rank_score = rank / (n - 1)
+    for cid in all_clients:
+        # 归一化：将累积Shapley值映射到[0, 1]
+        if max_val > min_val:
+            # (value - min) / (max - min) 归一化
+            normalized_score = (pass_gtg_state.cumulative_shapley[cid] - min_val) / (max_val - min_val)
         else:
-            rank_score = 1.0
+            # 所有值相同，设为0.5
+            normalized_score = 0.5
         
         # 使用移动平均平滑分数变化
         old_score = pass_gtg_state.contribution_scores[cid]
         new_score = pass_gtg_state.alpha * old_score + \
-                   (1 - pass_gtg_state.alpha) * rank_score
+                   (1 - pass_gtg_state.alpha) * normalized_score
         
         pass_gtg_state.contribution_scores[cid] = new_score
